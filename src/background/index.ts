@@ -224,27 +224,36 @@ onMessageType('DIAGRAM_CHANGED', async (payload) => {
   backgroundLogger.info('Diagram change received from content script');
 
   try {
-    const { diagramId, name, data, hash } = payload;
+    const { name, data, hash, url } = payload;
     const deviceId = await getDeviceId();
 
-    // Check if diagram already exists in local storage
-    let existingDiagram = await db.getDiagram(diagramId);
+    backgroundLogger.info('Payload:', { name, hash, url, dataSize: JSON.stringify(data).length });
 
-    if (!existingDiagram) {
-      // Try to find by hash (might be the same diagram with different ID)
-      const allDiagrams = await db.getAllDiagrams();
-      existingDiagram = allDiagrams.find((d) => d.hash === hash);
-    }
+    // Helper function to validate UUID format
+    const isValidUUID = (id: string): boolean => {
+      const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      return uuidRegex.test(id);
+    };
+
+    // ALWAYS generate a fresh UUID - DO NOT reuse old IDs
+    // This ensures we never have invalid IDs
+    const diagramId = crypto.randomUUID();
+
+    backgroundLogger.info(`Generated NEW diagram ID: ${diagramId}`);
+    backgroundLogger.info(`UUID validation: ${isValidUUID(diagramId)}`);
 
     const diagram: Diagram = {
-      id: existingDiagram?.id || diagramId,
-      name: existingDiagram?.name || name,
-      data,
+      id: diagramId,
+      name: name,
+      data: {
+        ...data,
+        source: url, // Store URL for reference
+      },
       hash,
       localTimestamp: Date.now(),
-      cloudTimestamp: existingDiagram?.cloudTimestamp || null,
-      cloudId: existingDiagram?.cloudId || null,
-      lastSynced: existingDiagram?.lastSynced || null,
+      cloudTimestamp: null,
+      cloudId: diagramId,
+      lastSynced: null,
       isSyncing: false,
       conflictStatus: 'none',
       deviceId,

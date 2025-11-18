@@ -27,6 +27,12 @@
       "matches": ["https://excalidraw.com/*", "http://localhost:*/*"],
       "js": ["src/content/index.ts"],
       "run_at": "document_end"
+    },
+    {
+      "matches": ["https://excalidraw.com/*", "http://localhost:*/*"],
+      "js": ["src/content/injected.ts"],
+      "run_at": "document_end",
+      "world": "MAIN"
     }
   ],
   "permissions": [

@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Excalidraw Sync Debug Test</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1200px;
+            margin: 20px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            border-bottom: 3px solid #667eea;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #667eea;
+            margin-top: 0;
+        }
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            margin: 5px;
+            font-weight: 600;
+        }
+        button:hover {
+            opacity: 0.9;
+        }
+        button:active {
+            transform: scale(0.98);
+        }
+        .status {
+            padding: 15px;
+            border-radius: 6px;
+            margin: 10px 0;
+        }
+        .status.success {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+        .status.error {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+        .status.info {
+            background: #d1ecf1;
+            border: 1px solid #bee5eb;
+            color: #0c5460;
+        }
+        pre {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 6px;
+            overflow-x: auto;
+            border: 1px solid #dee2e6;
+        }
+        .result {
+            margin: 10px 0;
+        }
+        .step {
+            background: #f8f9fa;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 6px;
+            border-left: 4px solid #667eea;
+        }
+        .log-entry {
+            padding: 8px;
+            margin: 5px 0;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+        }
+        .log-entry.success { background: #d4edda; }
+        .log-entry.error { background: #f8d7da; }
+        .log-entry.info { background: #d1ecf1; }
+        .log-entry.warning { background: #fff3cd; }
+    </style>
+</head>
+<body>
+    <h1>🔍 Excalidraw Sync Extension - Debug Test</h1>
+
+    <div class="container">
+        <h2>Step 1: Check Extension Context</h2>
+        <button onclick="checkExtensionContext()">Check Extension APIs</button>
+        <div id="extensionContext" class="result"></div>
+    </div>
+
+    <div class="container">
+        <h2>Step 2: Check Content Script</h2>
+        <button onclick="checkContentScript()">Check Content Script</button>
+        <div id="contentScriptResult" class="result"></div>
+    </div>
+
+    <div class="container">
+        <h2>Step 3: Check Injected Script (MAIN world)</h2>
+        <button onclick="checkInjectedScript()">Check Injected Script</button>
+        <div id="injectedScriptResult" class="result"></div>
+    </div>
+
+    <div class="container">
+        <h2>Step 4: Check localStorage Data</h2>
+        <button onclick="checkLocalStorage()">Check localStorage</button>
+        <button onclick="createTestData()">Create Test Data</button>
+        <div id="localStorageResult" class="result"></div>
+    </div>
+
+    <div class="container">
+        <h2>Step 5: Test Message Flow</h2>
+        <button onclick="testMessageFlow()">Test postMessage Flow</button>
+        <button onclick="forceSync()">Force Manual Sync</button>
+        <div id="messageFlowResult" class="result"></div>
+    </div>
+
+    <div class="container">
+        <h2>Step 6: Check IndexedDB</h2>
+        <button onclick="checkIndexedDB()">Check IndexedDB Diagrams</button>
+        <div id="indexedDBResult" class="result"></div>
+    </div>
+
+    <div class="container">
+        <h2>Live Console Logs</h2>
+        <button onclick="clearLogs()">Clear Logs</button>
+        <div id="consoleLogs"></div>
+    </div>
+
+    <script>
+        const logs = [];
+
+        function log(message, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            logs.push({ timestamp, message, type });
+            updateLogs();
+            console.log(`[${timestamp}] ${message}`);
+        }
+
+        function updateLogs() {
+            const container = document.getElementById('consoleLogs');
+            container.innerHTML = logs.slice(-20).reverse().map(l =>
+                `<div class="log-entry ${l.type}">[${l.timestamp}] ${l.message}</div>`
+            ).join('');
+        }
+
+        function clearLogs() {
+            logs.length = 0;
+            updateLogs();
+        }
+
+        // Intercept console methods
+        const originalLog = console.log;
+        const originalError = console.error;
+        const originalWarn = console.warn;
+
+        console.log = function(...args) {
+            log(args.join(' '), 'info');
+            originalLog.apply(console, args);
+        };
+
+        console.error = function(...args) {
+            log(args.join(' '), 'error');
+            originalError.apply(console, args);
+        };
+
+        console.warn = function(...args) {
+            log(args.join(' '), 'warning');
+            originalWarn.apply(console, args);
+        };
+
+        function checkExtensionContext() {
+            const result = document.getElementById('extensionContext');
+            const checks = {
+                'chrome': typeof chrome !== 'undefined',
+                'chrome.runtime': typeof chrome?.runtime !== 'undefined',
+                'chrome.runtime.id': chrome?.runtime?.id !== undefined,
+                'chrome.runtime.sendMessage': typeof chrome?.runtime?.sendMessage === 'function',
+            };
+
+            const allGood = Object.values(checks).every(v => v);
+
+            result.innerHTML = `
+                <div class="status ${allGood ? 'success' : 'error'}">
+                    ${allGood ? '✅ All Chrome APIs Available' : '❌ Some Chrome APIs Missing'}
+                </div>
+                <pre>${JSON.stringify(checks, null, 2)}</pre>
+            `;
+
+            log('Extension context check completed', allGood ? 'success' : 'error');
+        }
+
+        function checkContentScript() {
+            const result = document.getElementById('contentScriptResult');
+
+            if (typeof window.excalidrawSyncContent === 'undefined') {
+                result.innerHTML = `
+                    <div class="status error">
+                        ❌ Content script NOT loaded
+                        <p>The content script (ISOLATED world) is not available.</p>
+                        <p><strong>Action:</strong> Reload the extension and refresh this page.</p>
+                    </div>
+                `;
+                log('Content script NOT found', 'error');
+                return;
+            }
+
+            const status = window.excalidrawSyncContent.status();
+
+            result.innerHTML = `
+                <div class="status success">
+                    ✅ Content script loaded (ISOLATED world)
+                </div>
+                <pre>${JSON.stringify(status, null, 2)}</pre>
+            `;
+
+            log('Content script loaded successfully', 'success');
+        }
+
+        function checkInjectedScript() {
+            const result = document.getElementById('injectedScriptResult');
+
+            if (typeof window.excalidrawSyncDebug === 'undefined') {
+                result.innerHTML = `
+                    <div class="status error">
+                        ❌ Injected script NOT loaded
+                        <p>The injected script (MAIN world) is not available.</p>
+                        <p><strong>Action:</strong> Check if world: "MAIN" is in manifest.json</p>
+                    </div>
+                `;
+                log('Injected script NOT found', 'error');
+                return;
+            }
+
+            const allData = window.excalidrawSyncDebug.getAllData();
+
+            result.innerHTML = `
+                <div class="status success">
+                    ✅ Injected script loaded (MAIN world)
+                </div>
+                <p><strong>Found ${Object.keys(allData).length} Excalidraw localStorage keys:</strong></p>
+                <pre>${JSON.stringify(allData, null, 2)}</pre>
+            `;
+
+            log(`Injected script loaded, found ${Object.keys(allData).length} keys`, 'success');
+        }
+
+        function checkLocalStorage() {
+            const result = document.getElementById('localStorageResult');
+            const allKeys = Object.keys(localStorage);
+            const excalidrawKeys = allKeys.filter(k => k.includes('excalidraw'));
+
+            result.innerHTML = `
+                <div class="status ${excalidrawKeys.length > 0 ? 'success' : 'info'}">
+                    ${excalidrawKeys.length > 0 ? '✅' : 'ℹ️'} Found ${excalidrawKeys.length} Excalidraw keys out of ${allKeys.length} total keys
+                </div>
+                <p><strong>All localStorage keys:</strong></p>
+                <pre>${JSON.stringify(allKeys, null, 2)}</pre>
+                ${excalidrawKeys.length > 0 ? `
+                    <p><strong>Excalidraw data preview:</strong></p>
+                    ${excalidrawKeys.map(key => {
+                        const value = localStorage.getItem(key);
+                        return `<div class="step">
+                            <strong>${key}</strong>: ${value ? value.substring(0, 200) + '...' : 'null'}
+                        </div>`;
+                    }).join('')}
+                ` : ''}
+            `;
+
+            log(`localStorage check: ${excalidrawKeys.length} Excalidraw keys found`,
+                excalidrawKeys.length > 0 ? 'success' : 'warning');
+        }
+
+        function createTestData() {
+            // Create minimal test Excalidraw data
+            const testData = [{
+                type: "rectangle",
+                id: "test-rect-" + Date.now(),
+                x: 100,
+                y: 100,
+                width: 200,
+                height: 150,
+                angle: 0,
+                strokeColor: "#000000",
+                backgroundColor: "#ffffff",
+                fillStyle: "hachure",
+                strokeWidth: 1,
+                roughness: 1,
+                opacity: 100,
+                isDeleted: false,
+                seed: Math.random() * 1000000
+            }];
+
+            localStorage.setItem('excalidraw', JSON.stringify(testData));
+
+            log('Test data created in localStorage', 'success');
+            alert('✅ Test data created! Check localStorage now.');
+            checkLocalStorage();
+        }
+
+        function testMessageFlow() {
+            const result = document.getElementById('messageFlowResult');
+            let messages = [];
+
+            // Listen for messages
+            const listener = (event) => {
+                if (event.source !== window) return;
+                if (event.data && event.data.type && event.data.type.startsWith('EXCALIDRAW_')) {
+                    messages.push({
+                        type: event.data.type,
+                        timestamp: new Date().toISOString(),
+                        payload: event.data.payload
+                    });
+
+                    result.innerHTML = `
+                        <div class="status success">
+                            ✅ Received ${messages.length} message(s) from injected script
+                        </div>
+                        <pre>${JSON.stringify(messages, null, 2)}</pre>
+                    `;
+
+                    log(`Message received: ${event.data.type}`, 'success');
+                }
+            };
+
+            window.addEventListener('message', listener);
+
+            // Trigger debug info
+            if (window.excalidrawSyncDebug) {
+                log('Triggering debug info from injected script...', 'info');
+                window.excalidrawSyncDebug.sendDebug();
+            }
+
+            // Clean up after 5 seconds
+            setTimeout(() => {
+                window.removeEventListener('message', listener);
+                if (messages.length === 0) {
+                    result.innerHTML = `
+                        <div class="status error">
+                            ❌ No messages received from injected script
+                            <p>The postMessage communication is not working.</p>
+                        </div>
+                    `;
+                    log('No messages received from injected script', 'error');
+                }
+            }, 5000);
+
+            result.innerHTML = `<div class="status info">⏳ Listening for messages... (5 seconds)</div>`;
+        }
+
+        function forceSync() {
+            if (window.excalidrawSyncContent) {
+                log('Forcing manual sync...', 'info');
+                window.excalidrawSyncContent.forceSync();
+                alert('✅ Manual sync triggered! Check the console and background worker logs.');
+            } else {
+                alert('❌ Content script not available');
+                log('Cannot force sync - content script not available', 'error');
+            }
+        }
+
+        async function checkIndexedDB() {
+            const result = document.getElementById('indexedDBResult');
+
+            try {
+                const dbRequest = indexedDB.open('ExcalidrawSyncDB');
+
+                dbRequest.onsuccess = async (event) => {
+                    const db = event.target.result;
+
+                    if (!db.objectStoreNames.contains('diagrams')) {
+                        result.innerHTML = `
+                            <div class="status error">
+                                ❌ No 'diagrams' object store found in IndexedDB
+                            </div>
+                        `;
+                        log('IndexedDB diagrams store not found', 'error');
+                        return;
+                    }
+
+                    const transaction = db.transaction(['diagrams'], 'readonly');
+                    const store = transaction.objectStore('diagrams');
+                    const getAllRequest = store.getAll();
+
+                    getAllRequest.onsuccess = () => {
+                        const diagrams = getAllRequest.result;
+
+                        result.innerHTML = `
+                            <div class="status ${diagrams.length > 0 ? 'success' : 'info'}">
+                                ${diagrams.length > 0 ? '✅' : 'ℹ️'} Found ${diagrams.length} diagram(s) in IndexedDB
+                            </div>
+                            ${diagrams.length > 0 ? `
+                                <pre>${JSON.stringify(diagrams.map(d => ({
+                                    id: d.id,
+                                    name: d.name,
+                                    hash: d.hash,
+                                    localTimestamp: new Date(d.localTimestamp).toISOString(),
+                                    cloudTimestamp: d.cloudTimestamp ? new Date(d.cloudTimestamp).toISOString() : null,
+                                    lastSynced: d.lastSynced ? new Date(d.lastSynced).toISOString() : null,
+                                    isSyncing: d.isSyncing,
+                                    size: d.size
+                                })), null, 2)}</pre>
+                            ` : '<p>No diagrams stored locally yet.</p>'}
+                        `;
+
+                        log(`IndexedDB check: ${diagrams.length} diagrams found`,
+                            diagrams.length > 0 ? 'success' : 'info');
+                    };
+
+                    getAllRequest.onerror = () => {
+                        result.innerHTML = `<div class="status error">❌ Error reading from IndexedDB</div>`;
+                        log('Error reading IndexedDB', 'error');
+                    };
+                };
+
+                dbRequest.onerror = () => {
+                    result.innerHTML = `
+                        <div class="status error">
+                            ❌ Could not open IndexedDB
+                            <p>The database might not be initialized yet.</p>
+                        </div>
+                    `;
+                    log('Could not open IndexedDB', 'error');
+                };
+            } catch (error) {
+                result.innerHTML = `
+                    <div class="status error">
+                        ❌ Error: ${error.message}
+                    </div>
+                `;
+                log(`IndexedDB error: ${error.message}`, 'error');
+            }
+        }
+
+        // Auto-run basic checks on load
+        window.addEventListener('load', () => {
+            log('Debug page loaded', 'info');
+            setTimeout(() => {
+                checkExtensionContext();
+                setTimeout(() => checkContentScript(), 500);
+                setTimeout(() => checkInjectedScript(), 1000);
+                setTimeout(() => checkLocalStorage(), 1500);
+            }, 1000);
+        });
+    </script>
+</body>
+</html>

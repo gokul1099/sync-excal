@@ -5,6 +5,7 @@
 import Dexie, { Table } from 'dexie';
 import type { Diagram, DiagramMetadata, ConflictDiagram } from '@/types/diagram';
 import type { SyncQueueItem, SyncSettings } from '@/types/sync';
+import { generateDeviceId } from '@/lib/utils/crypto';
 
 export interface StoredSettings {
   key: string;
@@ -137,7 +138,6 @@ export async function getDeviceId(): Promise<string> {
   let deviceId = await db.getSetting<string>('deviceId');
   if (!deviceId) {
     // Generate new device ID
-    const { generateDeviceId } = await import('@/lib/utils/crypto');
     deviceId = await generateDeviceId();
     await db.saveSetting('deviceId', deviceId);
   }

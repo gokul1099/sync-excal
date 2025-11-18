@@ -1,223 +1,240 @@
 /**
- * Content script - runs on Excalidraw pages
- * Monitors localStorage for diagram changes and communicates with background
+ * Content script - runs in ISOLATED world
+ * Injects script into MAIN world and communicates via postMessage
+ * Forwards Excalidraw data to background service worker
  */
 
 import { contentLogger } from '@/lib/utils/logger';
 import { sendToBackground } from '@/lib/utils/messaging';
-import { isValidExcalidrawData } from '@/lib/utils/validators';
 import { calculateHash } from '@/lib/utils/crypto';
 import type { ExcalidrawData } from '@/types/diagram';
 
-let lastDiagramHash: string | null = null;
-let debounceTimer: number | null = null;
-const DEBOUNCE_DELAY = 3000; // 3 seconds
+// Track state
+let isInitialized = false;
+let lastSyncedHash: string | null = null;
 
 /**
- * Extract Excalidraw data from localStorage
+ * Check if we're on an Excalidraw page
  */
-function getExcalidrawData(): ExcalidrawData | null {
-  try {
-    // Excalidraw stores data in localStorage with different formats:
-    // Format 1: Direct array in 'excalidraw' key (current Excalidraw)
-    // Format 2: Full object with type/version/elements (exported files)
+function isExcalidrawPage(): boolean {
+  // Check URL
+  const isExcalidrawDomain = window.location.hostname === 'excalidraw.com' ||
+                             window.location.hostname.endsWith('.excalidraw.com') ||
+                             window.location.hostname === 'localhost';
 
-    const keys = Object.keys(localStorage);
-    contentLogger.debug('All localStorage keys:', keys.length);
-
-    // Find the main data key (not state, collab, theme, etc.)
-    const excalidrawKey = keys.find((key) =>
-      key === 'excalidraw' ||
-      (key.startsWith('excalidraw') && !key.includes('state') && !key.includes('collab') && !key.includes('theme'))
-    );
-    contentLogger.debug('Found excalidraw key:', excalidrawKey || 'none');
-
-    if (!excalidrawKey) {
-      contentLogger.debug('No Excalidraw data found in localStorage');
-      return null;
-    }
-
-    const rawData = localStorage.getItem(excalidrawKey);
-    if (!rawData) {
-      contentLogger.warn('Excalidraw key exists but no data');
-      return null;
-    }
-
-    contentLogger.debug('Raw data length:', rawData.length);
-    const parsedData = JSON.parse(rawData);
-
-    // Check if it's an array (current Excalidraw format) or object (export format)
-    let data: ExcalidrawData;
-
-    if (Array.isArray(parsedData)) {
-      // Format 1: Direct array of elements
-      contentLogger.info('Detected array format (current Excalidraw)');
-      contentLogger.debug('Elements count:', parsedData.length);
-
-      // Get app state from separate key
-      const stateRaw = localStorage.getItem('excalidraw-state');
-      const appState = stateRaw ? JSON.parse(stateRaw) : {};
-
-      // Construct proper Excalidraw data structure
-      data = {
-        type: 'excalidraw',
-        version: 2,
-        source: 'https://excalidraw.com',
-        elements: parsedData,
-        appState: appState,
-        files: {} // Files are stored separately if present
-      };
-    } else if (parsedData.type === 'excalidraw') {
-      // Format 2: Already in correct format
-      contentLogger.info('Detected full object format');
-      contentLogger.debug('Elements count:', parsedData.elements?.length || 0);
-      data = parsedData;
-    } else {
-      contentLogger.warn('Unknown data format');
-      contentLogger.debug('Data structure:', Object.keys(parsedData));
-      return null;
-    }
-
-    // Skip validation if we constructed it ourselves, otherwise validate
-    if (!Array.isArray(parsedData) && !isValidExcalidrawData(data)) {
-      contentLogger.warn('Invalid Excalidraw data format');
-      return null;
-    }
-
-    contentLogger.info('✅ Valid Excalidraw data extracted');
-    return data;
-  } catch (error) {
-    contentLogger.error('Error extracting Excalidraw data:', error);
-    return null;
+  if (!isExcalidrawDomain) {
+    return false;
   }
+
+  // Check for Excalidraw-specific elements in the DOM
+  const hasExcalidrawUI = !!(
+    document.querySelector('.excalidraw') ||
+    document.querySelector('[data-testid="canvas"]') ||
+    document.querySelector('.excalidraw__canvas')
+  );
+
+  contentLogger.info('Excalidraw page check:', {
+    domain: isExcalidrawDomain,
+    hasUI: hasExcalidrawUI,
+    url: window.location.href
+  });
+
+  return isExcalidrawDomain || hasExcalidrawUI;
 }
 
 /**
  * Generate diagram name from data or URL
  */
 function generateDiagramName(data: ExcalidrawData): string {
-  // Try to extract name from URL or data
-  const urlParams = new URLSearchParams(window.location.hash.substring(1));
-  const roomId = urlParams.get('room');
+  try {
+    // Try to extract name from URL hash (room ID for collaborative sessions)
+    const hash = window.location.hash;
+    if (hash && hash.includes('room')) {
+      const urlParams = new URLSearchParams(hash.substring(1));
+      const roomId = urlParams.get('room');
+      if (roomId) {
+        return `Excalidraw - ${roomId.substring(0, 8)}`;
+      }
+    }
 
-  if (roomId) {
-    return `Excalidraw - ${roomId}`;
+    // Try to extract from URL path
+    const path = window.location.pathname;
+    if (path && path !== '/' && path !== '/index.html') {
+      return `Excalidraw - ${path.replace(/\//g, '')}`;
+    }
+
+    // Use element count and timestamp
+    const elementCount = data.elements.filter((e: any) => !e.isDeleted).length;
+    const timestamp = new Date().toISOString().split('T')[0];
+
+    if (elementCount > 0) {
+      return `Diagram ${timestamp} (${elementCount} elements)`;
+    }
+
+    return `Diagram ${timestamp}`;
+  } catch (error) {
+    contentLogger.error('Error generating diagram name:', error);
+    return `Diagram ${new Date().toISOString()}`;
   }
-
-  // Use timestamp or element count
-  const elementCount = data.elements.filter((e) => !e.isDeleted).length;
-  const timestamp = new Date().toISOString().split('T')[0];
-  return `Diagram ${timestamp} (${elementCount} elements)`;
 }
 
 /**
- * Send diagram to background for syncing
+ * Handle diagram data received from injected script
  */
-async function syncDiagram(data: ExcalidrawData) {
+async function handleDiagramData(payload: any) {
   try {
-    const hash = await calculateHash(data);
+    const { diagram, hash: simpleHash, url } = payload;
 
-    // Skip if diagram hasn't changed
-    if (hash === lastDiagramHash) {
-      contentLogger.debug('Diagram unchanged, skipping sync');
+    contentLogger.info('Received diagram data from injected script');
+    contentLogger.info('Elements:', diagram.elements?.length);
+    contentLogger.info('Simple hash:', simpleHash);
+
+    // Calculate proper hash
+    const properHash = await calculateHash(diagram);
+    contentLogger.info('Calculated hash:', properHash);
+
+    // Skip if already synced
+    if (properHash === lastSyncedHash) {
+      contentLogger.debug('Diagram already synced, skipping');
       return;
     }
 
-    lastDiagramHash = hash;
+    lastSyncedHash = properHash;
 
-    const name = generateDiagramName(data);
-    const diagramId = crypto.randomUUID();
+    // Generate diagram name
+    const name = generateDiagramName(diagram);
+    contentLogger.info('Generated name:', name);
 
-    contentLogger.info(`Diagram changed, queuing sync: ${name}`);
+    // Send to background for syncing
+    // Background will handle ID generation and deduplication
+    contentLogger.info(`📤 Sending diagram to background: ${name}`);
 
     await sendToBackground('DIAGRAM_CHANGED', {
-      diagramId,
       name,
-      data,
-      hash,
-      url: window.location.href,
+      data: diagram,
+      hash: properHash,
+      url: url || window.location.href,
     });
 
-    contentLogger.info('Diagram change sent to background');
+    contentLogger.info('✅ Diagram sent to background successfully');
+
+    // Show success indicator
+    showSyncIndicator('✅ Synced');
   } catch (error) {
-    contentLogger.error('Error syncing diagram:', error);
+    contentLogger.error('Error handling diagram data:', error);
+    showSyncIndicator('❌ Error', true);
   }
 }
 
 /**
- * Debounced diagram sync
+ * Handle initialization message from injected script
  */
-function debouncedSync() {
-  if (debounceTimer !== null) {
-    clearTimeout(debounceTimer);
+function handleInit(payload: any) {
+  contentLogger.info('Injected script initialized:', payload);
+  isInitialized = true;
+
+  if (payload.dataCount > 0) {
+    contentLogger.info(`✅ Found ${payload.dataCount} Excalidraw localStorage keys`);
+    contentLogger.info('Keys:', payload.keys);
+  } else {
+    contentLogger.warn('No Excalidraw data found in localStorage');
+    contentLogger.info('This might mean:');
+    contentLogger.info('1. No diagram is currently loaded');
+    contentLogger.info('2. Excalidraw hasn\'t saved anything yet');
+    contentLogger.info('3. Try drawing something on the canvas');
+  }
+}
+
+/**
+ * Handle debug message from injected script
+ */
+function handleDebug(payload: any) {
+  contentLogger.info('=== DEBUG INFO FROM INJECTED SCRIPT ===');
+  contentLogger.info('All localStorage keys:', payload.allKeys);
+  contentLogger.info('Excalidraw data:', payload.excalidrawData);
+  contentLogger.info('URL:', payload.url);
+  contentLogger.info('=====================================');
+}
+
+/**
+ * Listen for messages from injected script
+ */
+function setupMessageListener() {
+  window.addEventListener('message', async (event) => {
+    // Only accept messages from same origin
+    if (event.source !== window) {
+      return;
+    }
+
+    const message = event.data;
+
+    // Check if it's our message
+    if (!message || !message.type || !message.type.startsWith('EXCALIDRAW_')) {
+      return;
+    }
+
+    contentLogger.debug('Received message from injected script:', message.type);
+
+    try {
+      switch (message.type) {
+        case 'EXCALIDRAW_DATA':
+          await handleDiagramData(message.payload);
+          break;
+
+        case 'EXCALIDRAW_INIT':
+          handleInit(message.payload);
+          break;
+
+        case 'EXCALIDRAW_DEBUG':
+          handleDebug(message.payload);
+          break;
+
+        default:
+          contentLogger.warn('Unknown message type:', message.type);
+      }
+    } catch (error) {
+      contentLogger.error('Error handling message:', error);
+    }
+  });
+
+  contentLogger.info('✅ Message listener set up');
+}
+
+/**
+ * Show sync status indicator
+ */
+function showSyncIndicator(text: string, isError: boolean = false) {
+  const existingIndicator = document.getElementById('excalidraw-sync-indicator');
+  if (existingIndicator) {
+    existingIndicator.remove();
   }
 
-  debounceTimer = window.setTimeout(() => {
-    const data = getExcalidrawData();
-    if (data) {
-      syncDiagram(data);
-    }
-    debounceTimer = null;
-  }, DEBOUNCE_DELAY);
-}
-
-/**
- * Monitor localStorage changes
- */
-function monitorLocalStorage() {
-  // Override localStorage.setItem to detect changes
-  const originalSetItem = localStorage.setItem;
-
-  localStorage.setItem = function (key: string, value: string) {
-    // Call original method
-    originalSetItem.call(this, key, value);
-
-    // Check if it's an Excalidraw key
-    if (key.startsWith('excalidraw') && !key.includes('state')) {
-      contentLogger.info('🔔 Excalidraw localStorage changed! Key:', key);
-      debouncedSync();
-    }
-  };
-
-  contentLogger.info('✅ localStorage monitoring started');
-  contentLogger.info('Monitoring for keys starting with "excalidraw"');
-}
-
-/**
- * Check if we're on an Excalidraw page
- */
-function isExcalidrawPage(): boolean {
-  // Check for Excalidraw-specific elements in the DOM
-  const excalidrawRoot =
-    document.querySelector('.excalidraw') || document.querySelector('[data-testid="canvas"]');
-  console.log("Is excalidraw", excalidrawRoot)
-  return !!excalidrawRoot;
-}
-
-/**
- * Add visual indicator that content script is active
- */
-function addDebugIndicator() {
   const indicator = document.createElement('div');
   indicator.id = 'excalidraw-sync-indicator';
-  indicator.textContent = '🔄 Sync Active';
+  indicator.textContent = text;
+
+  const bgColor = isError
+    ? 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)'
+    : 'linear-gradient(135deg, #10b981 0%, #059669 100%)';
+
   indicator.style.cssText = `
     position: fixed;
     bottom: 20px;
     right: 20px;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background: ${bgColor};
     color: white;
-    padding: 8px 16px;
-    border-radius: 20px;
+    padding: 12px 20px;
+    border-radius: 24px;
     font-family: system-ui, -apple-system, sans-serif;
-    font-size: 12px;
+    font-size: 13px;
     font-weight: 600;
     z-index: 999999;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
     pointer-events: none;
     opacity: 0;
     transition: opacity 0.3s ease;
   `;
+
   document.body.appendChild(indicator);
 
   // Fade in
@@ -225,7 +242,7 @@ function addDebugIndicator() {
     indicator.style.opacity = '1';
   }, 100);
 
-  // Fade out after 3 seconds
+  // Fade out and remove
   setTimeout(() => {
     indicator.style.opacity = '0';
     setTimeout(() => indicator.remove(), 300);
@@ -233,54 +250,49 @@ function addDebugIndicator() {
 }
 
 /**
- * Expose debug functions to window for manual testing
+ * Add permanent status indicator
  */
-function exposeDebugFunctions() {
-  (window as any).excalidrawSync = {
-    getLocalStorage: () => {
-      const keys = Object.keys(localStorage);
-      const excalidrawKeys = keys.filter(k => k.includes('excalidraw'));
-      console.log('All localStorage keys:', keys);
-      console.log('Excalidraw keys:', excalidrawKeys);
-      return excalidrawKeys.map(key => ({
-        key,
-        valueLength: localStorage.getItem(key)?.length || 0,
-        preview: (localStorage.getItem(key) || '').substring(0, 100)
-      }));
-    },
-    getData: () => {
-      const data = getExcalidrawData();
-      console.log('Extracted Excalidraw data:', data);
-      return data;
-    },
-    forceSync: () => {
-      const data = getExcalidrawData();
-      if (data) {
-        syncDiagram(data);
-        console.log('✅ Manual sync triggered');
-      } else {
-        console.warn('⚠️ No diagram data found');
-      }
-    },
-    status: () => {
-      console.log('Content script status:', {
-        url: window.location.href,
-        isExcalidrawPage: isExcalidrawPage(),
-        lastHash: lastDiagramHash,
-        localStorageKeys: Object.keys(localStorage).filter(k => k.includes('excalidraw'))
-      });
-    }
-  };
+function addStatusBadge() {
+  const badge = document.createElement('div');
+  badge.id = 'excalidraw-sync-badge';
+  badge.textContent = '🔄';
+  badge.title = 'Excalidraw Sync Active';
 
-  console.log(
-    '%c🔄 Excalidraw Sync Debug Tools',
-    'background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 8px 16px; border-radius: 4px; font-weight: bold;'
-  );
-  console.log('Available commands:');
-  console.log('  window.excalidrawSync.getLocalStorage() - View localStorage data');
-  console.log('  window.excalidrawSync.getData() - Extract current diagram');
-  console.log('  window.excalidrawSync.forceSync() - Force sync now');
-  console.log('  window.excalidrawSync.status() - Show status');
+  badge.style.cssText = `
+    position: fixed;
+    bottom: 20px;
+    left: 20px;
+    width: 40px;
+    height: 40px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    font-size: 18px;
+    z-index: 999998;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+    cursor: pointer;
+    transition: transform 0.2s ease;
+  `;
+
+  badge.addEventListener('mouseenter', () => {
+    badge.style.transform = 'scale(1.1)';
+  });
+
+  badge.addEventListener('mouseleave', () => {
+    badge.style.transform = 'scale(1)';
+  });
+
+  badge.addEventListener('click', () => {
+    // Trigger manual sync via injected script
+    window.postMessage({ type: 'TRIGGER_SYNC' }, '*');
+    showSyncIndicator('🔄 Syncing...');
+  });
+
+  document.body.appendChild(badge);
+  contentLogger.info('Status badge added');
 }
 
 /**
@@ -292,9 +304,10 @@ function verifyChromeAPIs(): boolean {
     'chrome.runtime': typeof chrome?.runtime !== 'undefined',
     'chrome.runtime.id': chrome?.runtime?.id !== undefined,
     'chrome.runtime.sendMessage': typeof chrome?.runtime?.sendMessage === 'function',
+    'chrome.runtime.getURL': typeof chrome?.runtime?.getURL === 'function',
   };
 
-  console.log('Chrome API availability:', checks);
+  contentLogger.info('Chrome API availability:', checks);
 
   const allAvailable = Object.values(checks).every(v => v === true);
 
@@ -304,86 +317,98 @@ function verifyChromeAPIs(): boolean {
     console.error('  1. Extension is not loaded in chrome://extensions/');
     console.error('  2. Extension was disabled or removed');
     console.error('  3. Page needs to be refreshed after loading extension');
-    console.error('\nReload the extension and refresh this page.');
+    console.error('\n👉 Reload the extension and refresh this page.');
   }
 
   return allAvailable;
 }
 
 /**
+ * Expose debug functions
+ */
+function exposeDebugFunctions() {
+  (window as any).excalidrawSyncContent = {
+    status: () => {
+      return {
+        url: window.location.href,
+        isExcalidrawPage: isExcalidrawPage(),
+        isInitialized,
+        lastSyncedHash,
+        chromeAPIsAvailable: verifyChromeAPIs()
+      };
+    },
+    triggerDebug: () => {
+      window.postMessage({ type: 'TRIGGER_DEBUG' }, '*');
+    },
+    forceSync: () => {
+      window.postMessage({ type: 'TRIGGER_SYNC' }, '*');
+    }
+  };
+
+  console.log(
+    '%c🔄 Excalidraw Sync Content Script (ISOLATED world)',
+    'background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 8px 16px; border-radius: 4px; font-weight: bold;'
+  );
+  console.log('Available commands:');
+  console.log('  window.excalidrawSyncContent.status() - Show status');
+  console.log('  window.excalidrawSyncContent.triggerDebug() - Show debug info');
+  console.log('  window.excalidrawSyncContent.forceSync() - Force sync');
+  console.log('\nMAIN world script debug tools:');
+  console.log('  window.excalidrawSyncDebug - Available from injected script');
+}
+
+/**
  * Initialize content script
  */
-function initialize() {
-  contentLogger.info('Content script initialize() called');
-  contentLogger.info('Current URL:', window.location.href);
+async function initialize() {
+  contentLogger.info('=== Excalidraw Sync Content Script Initializing ===');
+  contentLogger.info('URL:', window.location.href);
+  contentLogger.info('Hostname:', window.location.hostname);
 
-  // First, verify Chrome APIs are available
+  // Verify Chrome APIs
   if (!verifyChromeAPIs()) {
-    console.error('⚠️ Cannot initialize: Chrome extension APIs unavailable');
+    contentLogger.error('❌ Cannot initialize: Chrome extension APIs unavailable');
+    console.error('Please reload the extension and refresh this page');
     return;
   }
 
+  // Check if Excalidraw page
   if (!isExcalidrawPage()) {
-    contentLogger.warn('Not an Excalidraw page, content script inactive');
-    contentLogger.info('Page hostname:', window.location.hostname);
+    contentLogger.warn('Not an Excalidraw page, skipping initialization');
     return;
   }
 
-  contentLogger.info('✅ Excalidraw page detected, initializing content script');
-
-  // Add visual indicator
-  addDebugIndicator();
+  contentLogger.info('✅ Excalidraw page detected');
 
   // Expose debug functions
   exposeDebugFunctions();
 
-  // Check localStorage immediately
-  const keys = Object.keys(localStorage);
-  contentLogger.info('localStorage keys:', keys);
-  const excalidrawKeys = keys.filter(k => k.includes('excalidraw'));
-  contentLogger.info('Excalidraw keys found:', excalidrawKeys);
+  // Set up message listener to receive data from injected script (MAIN world)
+  setupMessageListener();
 
-  // Start monitoring
-  monitorLocalStorage();
+  // Note: Injected script is automatically loaded by Chrome via manifest.json
+  // with "world": "MAIN" configuration
 
-  // Initial sync check - try multiple times as page loads
-  let attempts = 0;
-  const maxAttempts = 5;
+  // Add status badge
+  setTimeout(() => {
+    addStatusBadge();
+  }, 1000);
 
-  const tryInitialSync = () => {
-    attempts++;
-    contentLogger.info(`Initial sync attempt ${attempts}/${maxAttempts}`);
+  // Show initial indicator
+  showSyncIndicator('🔄 Sync Active');
 
-    const data = getExcalidrawData();
-    if (data) {
-      contentLogger.info('✅ Initial diagram found!');
-      syncDiagram(data);
-    } else {
-      contentLogger.warn('No diagram data found yet');
-      if (attempts < maxAttempts) {
-        setTimeout(tryInitialSync, 2000);
-      }
-    }
-  };
-
-  setTimeout(tryInitialSync, 2000); // Wait for page to fully load
-
-  // Periodic check (backup for missed events)
-  setInterval(() => {
-    const data = getExcalidrawData();
-    if (data) {
-      syncDiagram(data);
-    }
-  }, 30000); // Check every 30 seconds
+  contentLogger.info('✅ Content script initialization complete');
+  contentLogger.info('Waiting for injected script (MAIN world) to initialize...');
 }
 
-// Run on page load
+// Wait for page to be ready
 if (document.readyState === 'loading') {
   contentLogger.info('Document still loading, waiting for DOMContentLoaded');
   document.addEventListener('DOMContentLoaded', initialize);
 } else {
   contentLogger.info('Document already loaded, initializing immediately');
-  initialize();
+  // Add small delay to ensure DOM is fully ready
+  setTimeout(initialize, 500);
 }
 
 contentLogger.info('Content script loaded');
